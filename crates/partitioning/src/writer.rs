@@ -9,6 +9,7 @@ use crate::{
 };
 use disks::BlockDevice;
 use gpt::{GptConfig, disk::LogicalBlockSize, mbr, partition_types};
+use log::{debug, trace};
 use std::{
     fs,
     io::{self, Seek, Write},
@@ -174,7 +175,7 @@ impl<'a> DiskWriter<'a> {
         let layout = self.planner.current_layout();
         let changes = self.planner.changes();
 
-        eprintln!("Changes: {changes:?}");
+        debug!("Changes: {changes:?}");
 
         for change in changes {
             match change {
@@ -183,7 +184,7 @@ impl<'a> DiskWriter<'a> {
                     original_index,
                 } => {
                     if let Some(id) = gpt_table.remove_partition(*partition_id) {
-                        println!("Deleted partition {partition_id} (index {original_index}): {id:?}");
+                        debug!("Deleted partition {partition_id} (index {original_index}): {id:?}");
                     }
                 }
                 Change::AddPartition {
@@ -196,14 +197,15 @@ impl<'a> DiskWriter<'a> {
                     let start_lba = *start / block_size;
                     let size_bytes = *end - *start;
                     let size_lba = size_bytes / block_size;
-                    let (part_type, part_name) = match attributes.as_ref().and_then(|a| a.table.as_gpt()) {
+                    let gpt_attributes = attributes.as_ref().and_then(|a| a.table.as_gpt());
+                    let (part_type, part_name) = match gpt_attributes {
                         Some(GptAttributes { type_guid, name, .. }) => {
                             (type_guid.clone(), name.clone().unwrap_or_default())
                         }
                         None => (partition_types::BASIC, "".to_string()),
                     };
 
-                    eprintln!(
+                    trace!(
                         "Converting partition: bytes {}..{} to LBA {}..{}",
                         start,
                         end,
@@ -212,7 +214,17 @@ impl<'a> DiskWriter<'a> {
                     );
                     let id =
                         gpt_table.add_partition_at(&part_name, *partition_id, start_lba, size_lba, part_type, 0)?;
-                    println!("Added partition {partition_id}: {id:?}");
+                    debug!("Added partition {partition_id}: {id:?}");
+
+                    // gpt assigns a random partition GUID, so replace it afterwards if the caller
+                    // asked for a specific one
+                    if let Some(uuid) = gpt_attributes.and_then(|a| a.uuid) {
+                        let mut partitions = gpt_table.partitions().clone();
+                        if let Some(partition) = partitions.get_mut(&id) {
+                            partition.part_guid = uuid;
+                        }
+                        gpt_table.update_partitions(partitions)?;
+                    }
                     // Store start and size for zeroing
                     if writable {
                         zero_regions.push((*start, *end));
@@ -221,10 +233,10 @@ impl<'a> DiskWriter<'a> {
             }
         }
 
-        eprintln!("### GPT is now: {gpt_table:?}");
+        trace!("GPT is now: {gpt_table:?}");
 
         for region in layout.iter() {
-            eprintln!(
+            trace!(
                 "Region at: {:?}",
                 region.partition_id.map(|i| self.device.partition_path(i as usize))
             );
